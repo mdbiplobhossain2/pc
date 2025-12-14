@@ -1,0 +1,124 @@
+name: RDP + Tailscale + WireGuard (Mobile-ready)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp-wireguard:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User
+        run: |
+          Add-Type -AssemblyName System.Security
+          $chars = @{
+            Upper = [char[]](65..90)
+            Lower = [char[]](97..122)
+            Number = [char[]](48..57)
+            Special = [char[]](33..47 + 58..64 + 91..96 + 123..126)
+          }
+          $pwd = ($chars.Upper | Get-Random -Count 4) + ($chars.Lower | Get-Random -Count 4) + ($chars.Number | Get-Random -Count 4) + ($chars.Special | Get-Random -Count 4)
+          $password = -join ($pwd | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          echo "RDP_CREDS=$password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installer = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          Start-Process msiexec.exe -ArgumentList "/i", $installer, "/quiet", "/norestart" -Wait
+          Remove-Item $installer -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          $tsIP = $null
+          $tries = 0
+          while (-not $tsIP -and $tries -lt 10) {
+            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            Start-Sleep 5
+            $tries++
+          }
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned"; exit 1 }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Install WireGuard
+        run: |
+          $url = "https://download.wireguard.com/windows-client/wireguard-installer.exe"
+          $installer = "$env:TEMP\wireguard.exe"
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          Start-Process -FilePath $installer -ArgumentList "/S" -Wait
+          Remove-Item $installer -Force
+
+      - name: Configure WireGuard Server
+        run: |
+          $wgDir = "$env:ProgramFiles\WireGuard"
+          $privateKey = & "$wgDir\wireguard.exe" /generatekey
+          $publicKey = & "$wgDir\wireguard.exe" /pubkey $privateKey
+          $wgConfigPath = "$wgDir\wg0.conf"
+
+          # Server config (Windows-safe)
+          $lines = @(
+            "[Interface]"
+            "PrivateKey = $privateKey"
+            "Address = 10.66.66.1/24"
+            "ListenPort = 51820"
+          )
+          $lines | Out-File -FilePath $wgConfigPath -Encoding ASCII
+
+          Start-Process -FilePath "$wgDir\wireguard.exe" -ArgumentList "/installtunnelservice `"$wgConfigPath`"" -Wait
+          echo "WG_SERVER_PRIVATEKEY=$privateKey" >> $env:GITHUB_ENV
+          echo "WG_SERVER_PUBLICKEY=$publicKey" >> $env:GITHUB_ENV
+
+      - name: Generate Mobile-ready WireGuard Config
+        run: |
+          $clientPrivateKey = & "$env:ProgramFiles\WireGuard\wireguard.exe" /generatekey
+          $clientPublicKey = & "$env:ProgramFiles\WireGuard\wireguard.exe" /pubkey $clientPrivateKey
+          $tsIP = $env:TAILSCALE_IP
+          $wgServerPub = $env:WG_SERVER_PUBLICKEY
+          $wgConfig = @"
+[Interface]
+PrivateKey = $clientPrivateKey
+Address = 10.66.66.2/24
+DNS = 1.1.1.1
+
+[Peer]
+PublicKey = $wgServerPub
+Endpoint = $tsIP:51820
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25
+"@
+          Write-Host "`n=== MOBILE WIREGUARD CONFIG ==="
+          Write-Host $wgConfig
+          Write-Host "==============================`n"
+
+      - name: Show All Access Info
+        run: |
+          Write-Host "`n=== ACCESS INFO ==="
+          Write-Host "RDP (Tailscale IP): $env:TAILSCALE_IP"
+          Write-Host "RDP Username: RDP"
+          Write-Host "RDP Password: $env:RDP_CREDS"
+          Write-Host "WireGuard UDP Port: 51820"
+          Write-Host "WireGuard Server Public Key: $env:WG_SERVER_PUBLICKEY"
+          Write-Host "==================`n"
+
+      - name: Maintain Connection
+        run: |
+          while ($true) {
+            Write-Host "[$(Get-Date)] RDP + WireGuard + Tailscale Active"
+            Start-Sleep 300
+          }
