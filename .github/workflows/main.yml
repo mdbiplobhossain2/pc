@@ -12,22 +12,26 @@ jobs:
       - name: Update and Install Desktop + XRDP
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y xfce4 xfce4-goodies xrdp ufw wget curl net-tools
+          sudo apt-get install -y xfce4 xfce4-goodies xrdp ufw wget curl net-tools openssl
 
-          # Set xfce as default for RDP sessions
+          # Set XFCE as default session for XRDP
           echo "startxfce4" | sudo tee /etc/skel/.xsession
-          echo "startxfce4" | sudo tee /home/$(whoami)/.xsession
-          sudo systemctl enable xrdp
-          sudo systemctl start xrdp
+          echo "startxfce4" | sudo tee ~/.xsession
 
-          # Configure firewall for RDP
+          # Fix XRDP startwm.sh to avoid black screen
+          sudo sed -i.bak '/^test -x \/etc\/X11\/Xsession && exec \/etc\/X11\/Xsession/i startxfce4' /etc/xrdp/startwm.sh
+
+          sudo systemctl enable xrdp
+          sudo systemctl restart xrdp
+
+          # Allow RDP through firewall
           sudo ufw allow 3389/tcp
           sudo ufw --force enable
 
       - name: Create RDP User with GUI Access
         run: |
-          PASSWORD=$(openssl rand -base64 16)
           USERNAME="rdpuser"
+          PASSWORD=$(openssl rand -base64 16)
           sudo useradd -m -s /bin/bash $USERNAME
           echo "$USERNAME:$PASSWORD" | sudo chpasswd
           sudo usermod -aG sudo $USERNAME
@@ -65,9 +69,10 @@ jobs:
           echo "Username: rdpuser"
           echo "Password: $RDP_CREDS"
           echo "=================="
-          
-          # Keep runner alive
+
+      - name: Keep Runner Alive for GUI Access
+        run: |
           while true; do
-              echo "[$(date)] RDP GUI Active - Use Ctrl+C in workflow to terminate"
+              echo "[$(date)] RDP GUI Active - Use Ctrl+C to terminate"
               sleep 300
           done
