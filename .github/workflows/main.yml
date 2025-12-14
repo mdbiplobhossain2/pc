@@ -11,6 +11,7 @@ jobs:
     steps:
       - name: Configure Core RDP Settings
         run: |
+          # Enable Remote Desktop and disable NLA
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                              -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
@@ -18,12 +19,14 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
 
+          # Configure firewall for RDP
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
 
+          # Restart RDP service
           Restart-Service -Name TermService -Force
 
-      - name: Create RDP User
+      - name: Create RDP User with Secure Password
         run: |
           Add-Type -AssemblyName System.Security
           $charSet = @{
@@ -42,14 +45,14 @@ jobs:
           New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          echo "RDP_CREDS=$password" >> $env:GITHUB_ENV
 
       - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Start-Process msiexec.exe -ArgumentList "/i", $installerPath, "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
@@ -78,15 +81,16 @@ jobs:
           $wgDir = "$env:ProgramFiles\WireGuard"
           $serverPrivateKey = & "$wgDir\wireguard.exe" /generatekey
           $serverPublicKey = & "$wgDir\wireguard.exe" /pubkey $serverPrivateKey
-          $wgConfig = @"
+          $wgConfigPath = "$wgDir\wg0.conf"
+          $wgConfigContent = @"
 [Interface]
 PrivateKey = $serverPrivateKey
 Address = 10.66.66.1/24
 ListenPort = 51820
 "@
-          $wgConfigPath = "$env:ProgramFiles\WireGuard\wg0.conf"
-          $wgConfig | Out-File -FilePath $wgConfigPath -Encoding ASCII
-          # Start WireGuard service
+          $wgConfigContent | Out-File -FilePath $wgConfigPath -Encoding ASCII
+
+          # Start WireGuard tunnel service
           Start-Process -FilePath "$wgDir\wireguard.exe" -ArgumentList "/installtunnelservice `"$wgConfigPath`"" -Wait
           echo "WG_SERVER_PUBLICKEY=$serverPublicKey" >> $env:GITHUB_ENV
 
@@ -95,17 +99,17 @@ ListenPort = 51820
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
           if (-not $testResult.TcpTestSucceeded) { Write-Error "RDP TCP test failed"; exit 1 }
 
-      - name: Show Access Info
+      - name: Show All Access Info
         run: |
-          Write-Host "=== ACCESS INFO ==="
-          Write-Host "RDP IP (Tailscale): $env:TAILSCALE_IP"
-          Write-Host "RDP User: RDP"
+          Write-Host "`n=== ACCESS INFO ==="
+          Write-Host "RDP (Tailscale IP): $env:TAILSCALE_IP"
+          Write-Host "RDP Username: RDP"
           Write-Host "RDP Password: $env:RDP_CREDS"
           Write-Host "WireGuard UDP Port: 51820"
           Write-Host "WireGuard Server Public Key: $env:WG_SERVER_PUBLICKEY"
-          Write-Host "=================="
+          Write-Host "==================`n"
 
-      - name: Keep Runner Alive
+      - name: Maintain Connection
         run: |
           while ($true) {
               Write-Host "[$(Get-Date)] RDP + WireGuard + Tailscale Active"
